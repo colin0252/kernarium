@@ -1,0 +1,156 @@
+# ============================================================================
+# Kernarium 未签名 IPA 打包（自签用）
+# 放到仓库：.github/workflows/build.yml
+# 手动触发：Actions → Build Kernarium IPA → Run workflow
+#
+# ⚠️ 重要提醒（务必先看）
+# 1) 这不是普通 Xcode 工程。App 直接 xcodebuild 会失败，因为缺 9 个
+#    XCFramework（KRuntime_6_18_4K / KRuntime_Android_6_18_4K / MesaEGL /
+#    MesaGallium / KosmicKrisp / GPTFDisk / LibZstd / HostBattery /
+#    HostVideoEncoder）。它们必须先由 CMake 把整套第三方依赖
+#    (Mesa、LLVM、virglrenderer、glib、libslirp …) 编出来才能生成。
+# 2) 整条链非常重：需要 Apple Silicon（arm64）机器 + 至少 64GB 空闲磁盘 +
+#    数小时。GitHub 免费托管机（macos-15 约 3 核 / 7GB 内存 / 14GB 磁盘）
+#    基本会在依赖编译阶段 OOM 或爆盘。建议挂「自建 Apple Silicon runner」
+#    或 GitHub 大规格 macOS runner 再跑。
+# 3) Kernarium 应用同时要 Linux(mainline-6.18) 和 Android 两套内核 bundle。
+#    发布页只公开了 Android 内核 + Lineage rootfs，没公开 mainline 内核
+#    bundle；后者需要在 x86_64 Linux 上自行编译后放进 .build/kernel/artifacts，
+#    否则下面的 kernarium-ios-device 步骤会失败。
+# 4) deployment target 本仓库是 27.0，因为设备端 GPU 用 KosmicKrisp，需要
+#    Metal 4（iOS 26+）。下面的步骤把它改成 18.0 以满足你的要求，但这样编出来
+#    的包在 iOS 18 真机上依然跑不了 GPU（缺 Metal 4）。仅当你确实需要改时才保留。
+# ============================================================================
+name: Build Kernarium IPA (unsigned)
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # 想真正跑通请改成自建大机器，例如： runs-on: [self-hosted, macOS, arm64]
+    runs-on: macos-15
+    timeout-minutes: 350
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          lfs: false
+
+      - name: Toolchain / host info
+        run: |
+          xcodebuild -version
+          sw_vers
+          echo "CPUs=$(sysctl -n hw.ncpu)  RAM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))"
+          df -h /
+
+      - name: Install build tools
+        run: |
+          set -eux
+          brew update
+          brew install cmake ninja meson pkg-config autoconf automake libtool gperf groff gettext rsync python@3.12 || true
+          echo "$(brew --prefix python@3.12)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix libtool)/libexec/gnubin" >> "$GITHUB_PATH"
+          cmake --version
+          python3 --version
+
+      - name: Metal toolchain component
+        run: xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Git identity (patch tooling needs a real email)
+        run: |
+          git config --global user.name  "ci"
+          git config --global user.email "ci@example.com"
+
+      - name: Cache dependency prefix + sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build/dependencies
+            .build/dependency-cache
+          key: kernarium-deps-${{ runner.os }}-${{ hashFiles('dependencies/manifest.tsv') }}
+          restore-keys: |
+            kernarium-deps-${{ runner.os }}-
+
+      - name: Prepare + build dependencies
+        run: |
+          set -eux
+          for p in macos apple-gpu-vulkan-experiment ios-network ios-storage ios-compression kernel-host-tools; do
+            dependencies/prepare.sh --product "$p"
+          done
+          dependencies/build.sh --platform macos
+          dependencies/build-apple-gpu.sh --platform ios --prefix "$PWD/.build/dependencies/apple-gpu-vulkan-experiment/ios-device-arm64"
+          dependencies/build-ios-network.sh --platform ios
+          dependencies/build-ios-storage.sh
+          dependencies/build-ios-zstd.sh
+          dependencies/build-kernel-host-tools.sh
+
+      - name: Fetch accepted kernel bundle + rootfs (public release)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          mkdir -p .build/kernel/artifacts .build/rootfs
+          gh release download 1.0b15-release -R imxieyi/Kernarium -p 'android-6.18-*.tar.gz' -D .build/kernel/artifacts --clobber
+          gh release download 1.0b15-release -R imxieyi/Kernarium -p 'lineage24-*.tar.gz'    -D .build/rootfs --clobber
+          ls -R .build/kernel/artifacts .build/rootfs
+          # 如需同时编 Linux 运行时，请把 mainline-6.18 的 accepted kernel bundle 也放到 .build/kernel/artifacts
+
+      - name: Build iOS runtime frameworks
+        run: |
+          set -eux
+          cmake --preset kernarium-ios-device
+          cmake --build --preset kernarium-ios-device
+          cmake --preset kernarium-ios-device-android
+          cmake --build --preset kernarium-ios-device-android
+          Kernarium/scripts/package-ios-frameworks.sh --sdk device
+          ls -1 .build/kernarium-xcframeworks
+
+      - name: Lower IPHONEOS_DEPLOYMENT_TARGET to 18.0
+        run: |
+          set -eux
+          python3 - <<'PY'
+          import re
+          p = 'Kernarium/Kernarium.xcodeproj/project.pbxproj'
+          s = open(p, encoding='utf-8').read()
+          s = re.sub(r'IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;', 'IPHONEOS_DEPLOYMENT_TARGET = 18.0;', s)
+          open(p, 'w', encoding='utf-8').write(s)
+          print('patched', p, 'hits =', s.count('IPHONEOS_DEPLOYMENT_TARGET = 18.0;'))
+          PY
+
+      - name: Build app (unsigned)
+        run: |
+          set -eux
+          xcodebuild \
+            -project Kernarium/Kernarium.xcodeproj \
+            -scheme Kernarium \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" CODE_SIGN_ENTITLEMENTS="" \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          set -eux
+          APP="build/Build/Products/Release-iphoneos/Kernarium.app"
+          test -d "$APP" || { echo "Kernarium.app 未生成"; ls -R build/Build/Products || true; exit 1; }
+          rm -rf out && mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          ( cd out && zip -qry "$GITHUB_WORKSPACE/Kernarium-unsigned.ipa" Payload )
+          shasum -a 256 Kernarium-unsigned.ipa
+          ls -lh Kernarium-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kernarium-unsigned-ipa
+          path: Kernarium-unsigned.ipa
+          if-no-files-found: error
