@@ -1,27 +1,19 @@
 # ============================================================================
-# Kernarium 未签名 IPA 打包（自签用）
-# 放到仓库：.github/workflows/build.yml
-# 手动触发：Actions → Build Kernarium IPA → Run workflow
+# Andarium(iOS 安卓容器) 未签名 IPA —— iOS 18.0 目标 + MoltenVK 路线骨架
+# 放到 fork 仓库：.github/workflows/build-andarium.yml
 #
-# ⚠️ 重要提醒（务必先看）
-# 1) 这不是普通 Xcode 工程。App 直接 xcodebuild 会失败，因为缺 9 个
-#    XCFramework（KRuntime_6_18_4K / KRuntime_Android_6_18_4K / MesaEGL /
-#    MesaGallium / KosmicKrisp / GPTFDisk / LibZstd / HostBattery /
-#    HostVideoEncoder）。它们必须先由 CMake 把整套第三方依赖
-#    (Mesa、LLVM、virglrenderer、glib、libslirp …) 编出来才能生成。
-# 2) 整条链非常重：需要 Apple Silicon（arm64）机器 + 至少 64GB 空闲磁盘 +
-#    数小时。GitHub 免费托管机（macos-15 约 3 核 / 7GB 内存 / 14GB 磁盘）
-#    基本会在依赖编译阶段 OOM 或爆盘。建议挂「自建 Apple Silicon runner」
-#    或 GitHub 大规格 macOS runner 再跑。
-# 3) Kernarium 应用同时要 Linux(mainline-6.18) 和 Android 两套内核 bundle。
-#    发布页只公开了 Android 内核 + Lineage rootfs，没公开 mainline 内核
-#    bundle；后者需要在 x86_64 Linux 上自行编译后放进 .build/kernel/artifacts，
-#    否则下面的 kernarium-ios-device 步骤会失败。
-# 4) deployment target 本仓库是 27.0，因为设备端 GPU 用 KosmicKrisp，需要
-#    Metal 4（iOS 26+）。下面的步骤把它改成 18.0 以满足你的要求，但这样编出来
-#    的包在 iOS 18 真机上依然跑不了 GPU（缺 Metal 4）。仅当你确实需要改时才保留。
+# 这个 workflow 做三件事：
+#   1) 跑 patch-ios18.sh 把全仓部署目标降到 18.0
+#   2) 按 Kernarium 官方顺序编依赖 + iOS runtime frameworks（GPU 见 MOLTENVK_SWAP.md）
+#   3) xcodebuild 出未签名 IPA
+#
+# ⚠️ 现实：
+#  - 需要 Apple Silicon 大内存机器（跑不通就改 runs-on 为自建 runner）。
+#  - GPU 后端换成 MoltenVK 的代码改动见 MOLTENVK_SWAP.md，是人工工程，不是这个 yml 能变出来的。
+#  - 本 yml 已按「降 18.0」就绪；GPU 部分仍调用 build-apple-gpu.sh（你按清单改它）。
+#  - 产物能否在 18.5 真机跑，取决于 MoltenVK↔Zink 特性对齐（MOLTENVK_SWAP.md 第 5 步）。
 # ============================================================================
-name: Build Kernarium IPA (unsigned)
+name: Build Andarium IPA (iOS18 + MoltenVK skeleton)
 
 on:
   workflow_dispatch: {}
@@ -31,9 +23,13 @@ on:
 permissions:
   contents: read
 
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 3G
+
 jobs:
   build:
-    # 想真正跑通请改成自建大机器，例如： runs-on: [self-hosted, macOS, arm64]
+    # 真跑通请用自建大机器： runs-on: [self-hosted, macOS, arm64]
     runs-on: macos-15
     timeout-minutes: 350
     steps:
@@ -41,95 +37,98 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          lfs: false
 
-      - name: Toolchain / host info
+      - name: Host info
         run: |
-          xcodebuild -version
-          sw_vers
-          echo "CPUs=$(sysctl -n hw.ncpu)  RAM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))"
-          df -h /
+          xcodebuild -version; sw_vers
+          echo "CPUs=$(sysctl -n hw.ncpu) RAM_GB=$(( $(sysctl -n hw.memsize)/1073741824 ))"; df -h /
 
       - name: Install build tools
         run: |
           set -eux
           brew update
-          brew install cmake ninja meson pkg-config autoconf automake libtool gperf groff gettext rsync python@3.12 || true
+          brew install cmake ninja meson pkg-config autoconf automake libtool gperf \
+                       groff gettext rsync ccache python@3.12 || true
           echo "$(brew --prefix python@3.12)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix libtool)/libexec/gnubin" >> "$GITHUB_PATH"
-          cmake --version
-          python3 --version
+          python3 --version; cmake --version
 
-      - name: Metal toolchain component
+      - name: Metal toolchain component (MoltenVK 不强制 Metal4，可失败)
         run: xcodebuild -downloadComponent MetalToolchain || true
 
-      - name: Git identity (patch tooling needs a real email)
+      - name: Git identity
         run: |
-          git config --global user.name  "ci"
+          git config --global user.name "ci"
           git config --global user.email "ci@example.com"
 
-      - name: Cache dependency prefix + sources
+      # ---- 关键：先把部署目标降到 18.0 ----
+      - name: Lower deployment target to 18.0
+        run: sh patch-ios18.sh
+
+      # ---- 缓存（同 Kernarium 分层缓存，命中即跳过）----
+      - name: Cache dependency sources
         uses: actions/cache@v4
         with:
-          path: |
-            .build/dependencies
-            .build/dependency-cache
-          key: kernarium-deps-${{ runner.os }}-${{ hashFiles('dependencies/manifest.tsv') }}
-          restore-keys: |
-            kernarium-deps-${{ runner.os }}-
+          path: .build/dependency-cache
+          key: deps-src-${{ runner.os }}-${{ hashFiles('dependencies/manifest.tsv') }}
+          restore-keys: deps-src-${{ runner.os }}-
+      - name: Cache dependency prefixes
+        uses: actions/cache@v4
+        with:
+          path: .build/dependencies
+          key: deps-build-${{ runner.os }}-${{ hashFiles('dependencies/manifest.tsv','dependencies/*.sh','dependencies/patches/**') }}
+          restore-keys: deps-build-${{ runner.os }}-
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: ccache-${{ runner.os }}-
 
-      - name: Prepare + build dependencies
+      - name: Prepare + build dependencies (skip if cached)
         run: |
           set -eux
           for p in macos apple-gpu-vulkan-experiment ios-network ios-storage ios-compression kernel-host-tools; do
             dependencies/prepare.sh --product "$p"
           done
-          dependencies/build.sh --platform macos
-          dependencies/build-apple-gpu.sh --platform ios --prefix "$PWD/.build/dependencies/apple-gpu-vulkan-experiment/ios-device-arm64"
-          dependencies/build-ios-network.sh --platform ios
-          dependencies/build-ios-storage.sh
-          dependencies/build-ios-zstd.sh
-          dependencies/build-kernel-host-tools.sh
+          GPU=".build/dependencies/apple-gpu-vulkan-experiment/ios-device-arm64"
+          if [ -d "$GPU" ] && [ -d ".build/dependencies/macos-arm64-18" -o -d ".build/dependencies/macos-arm64-27" ]; then
+            echo ">>> 依赖已缓存，跳过"
+          else
+            dependencies/build.sh --platform macos
+            dependencies/build-apple-gpu.sh --platform ios --prefix "$PWD/$GPU"
+            dependencies/build-ios-network.sh --platform ios
+            dependencies/build-ios-storage.sh
+            dependencies/build-ios-zstd.sh
+            dependencies/build-kernel-host-tools.sh
+          fi
 
-      - name: Fetch accepted kernel bundle + rootfs (public release)
+      - name: Fetch Android kernel + Lineage rootfs (skip if present)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eux
           mkdir -p .build/kernel/artifacts .build/rootfs
-          gh release download 1.0b15-release -R imxieyi/Kernarium -p 'android-6.18-*.tar.gz' -D .build/kernel/artifacts --clobber
-          gh release download 1.0b15-release -R imxieyi/Kernarium -p 'lineage24-*.tar.gz'    -D .build/rootfs --clobber
+          [ -n "$(ls -A .build/kernel/artifacts 2>/dev/null)" ] || \
+            gh release download 1.0b15-release -R imxieyi/Kernarium -p 'android-6.18-*.tar.gz' -D .build/kernel/artifacts --clobber
+          [ -n "$(ls -A .build/rootfs 2>/dev/null)" ] || \
+            gh release download 1.0b15-release -R imxieyi/Kernarium -p 'lineage24-*.tar.gz' -D .build/rootfs --clobber
           ls -R .build/kernel/artifacts .build/rootfs
-          # 如需同时编 Linux 运行时，请把 mainline-6.18 的 accepted kernel bundle 也放到 .build/kernel/artifacts
 
-      - name: Build iOS runtime frameworks
+      - name: Build iOS Android runtime + package frameworks
         run: |
           set -eux
-          cmake --preset kernarium-ios-device
-          cmake --build --preset kernarium-ios-device
           cmake --preset kernarium-ios-device-android
           cmake --build --preset kernarium-ios-device-android
-          Kernarium/scripts/package-ios-frameworks.sh --sdk device
+          Kernarium/scripts/package-ios-frameworks.sh --sdk device --runtimes android
           ls -1 .build/kernarium-xcframeworks
 
-      - name: Lower IPHONEOS_DEPLOYMENT_TARGET to 18.0
-        run: |
-          set -eux
-          python3 - <<'PY'
-          import re
-          p = 'Kernarium/Kernarium.xcodeproj/project.pbxproj'
-          s = open(p, encoding='utf-8').read()
-          s = re.sub(r'IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+;', 'IPHONEOS_DEPLOYMENT_TARGET = 18.0;', s)
-          open(p, 'w', encoding='utf-8').write(s)
-          print('patched', p, 'hits =', s.count('IPHONEOS_DEPLOYMENT_TARGET = 18.0;'))
-          PY
-
-      - name: Build app (unsigned)
+      - name: Build Andarium app (unsigned)
         run: |
           set -eux
           xcodebuild \
-            -project Kernarium/Kernarium.xcodeproj \
-            -scheme Kernarium \
+            -project Andarium/Andarium.xcodeproj \
+            -scheme Andarium \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
@@ -140,17 +139,16 @@ jobs:
       - name: Package unsigned IPA
         run: |
           set -eux
-          APP="build/Build/Products/Release-iphoneos/Kernarium.app"
-          test -d "$APP" || { echo "Kernarium.app 未生成"; ls -R build/Build/Products || true; exit 1; }
+          APP="$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)"
+          test -n "$APP" || { echo '未生成 .app'; ls -R build/Build/Products || true; exit 1; }
           rm -rf out && mkdir -p out/Payload
           cp -R "$APP" out/Payload/
-          ( cd out && zip -qry "$GITHUB_WORKSPACE/Kernarium-unsigned.ipa" Payload )
-          shasum -a 256 Kernarium-unsigned.ipa
-          ls -lh Kernarium-unsigned.ipa
+          ( cd out && zip -qry "$GITHUB_WORKSPACE/Andarium-unsigned.ipa" Payload )
+          shasum -a 256 Andarium-unsigned.ipa; ls -lh Andarium-unsigned.ipa
 
-      - name: Upload IPA artifact
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Kernarium-unsigned-ipa
-          path: Kernarium-unsigned.ipa
+          name: Andarium-unsigned-ipa
+          path: Andarium-unsigned.ipa
           if-no-files-found: error
