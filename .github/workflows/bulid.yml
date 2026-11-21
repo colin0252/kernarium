@@ -1,14 +1,12 @@
 # ============================================================================
-# Andarium 未签名 IPA —— iOS18 目标 + MoltenVK 路线骨架 + 可命中缓存
+# Andarium 未签名 IPA —— iOS18 目标 + MoltenVK 路线骨架（修正 step12 参数错误）
 # 放 fork 仓库：.github/workflows/build-andarium.yml
 #
-# 缓存真相（先看）：
-#  - GitHub 托管仓缓存上限 10GB/仓库；整套依赖前缀可能超限 → 存不下会警告并跳过保存。
-#    （sources + xcframeworks + ccache 一定能存；dependencies 前缀看体积，命中就省最多）
-#  - 依赖脚本用 xcrun --find clang 绝对路径，ccache 拦不住；本文件用
-#    CMAKE_*_COMPILER_LAUNCHER 只给 CMake runtime 编译加速。
-#  - 想“每次都省时间”最稳：改 runs-on 为自建 [self-hosted, macOS, arm64]，
-#    并把 CACHE_DIR 指到本地固定目录（见 env），不受 10GB 限制。
+# 本版修复：
+#  - build.sh(macos) 不再传 --platform（它不接受）
+#  - kernel-host-tools 先跑 archive-manifest 准备 pahole/libelf 归档
+#  - 每个 builder 打开 set -x，失败时日志能直接看到是哪一行
+# 缓存同前：5 段，命中即跳过；依赖前缀带体积守卫（>MAX_CACHE_MB 不保存）
 # ============================================================================
 name: Build Andarium IPA (iOS18 + MoltenVK skeleton)
 
@@ -23,7 +21,6 @@ permissions:
 env:
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 3G
-  # MAX_CACHE_MB：单次允许保存的依赖前缀体积上限，超过就跳过保存（避免踩 10GB 配额）
   MAX_CACHE_MB: "8000"
 
 jobs:
@@ -61,7 +58,7 @@ jobs:
       - name: Lower deployment target to 18.0
         run: sh patch-ios18.sh
 
-      # ================= 缓存 1：依赖源码 =================
+      # ===== 缓存 =====
       - name: Restore deps sources
         id: c-src
         uses: actions/cache@v4
@@ -70,7 +67,6 @@ jobs:
           key: deps-src-${{ runner.os }}-${{ hashFiles('dependencies/manifest.tsv') }}
           restore-keys: deps-src-${{ runner.os }}-
 
-      # ================= 缓存 2：依赖编译前缀（最贵，可能超限）=================
       - name: Restore deps prefixes
         id: c-prefix
         uses: actions/cache/restore@v4
@@ -79,7 +75,6 @@ jobs:
           key: deps-build-${{ runner.os }}-${{ hashFiles('dependencies/manifest.tsv','dependencies/*.sh','dependencies/patches/**') }}
           restore-keys: deps-build-${{ runner.os }}-
 
-      # ================= 缓存 3：ccache =================
       - name: Restore ccache
         uses: actions/cache@v4
         with:
@@ -87,7 +82,6 @@ jobs:
           key: ccache-${{ runner.os }}-${{ github.sha }}
           restore-keys: ccache-${{ runner.os }}-
 
-      # ================= 缓存 4：SPM 依赖（libghostty-spm）=================
       - name: Restore SwiftPM caches
         uses: actions/cache@v4
         with:
@@ -97,36 +91,49 @@ jobs:
           key: spm-${{ runner.os }}-${{ hashFiles('Kernarium/**/Package.resolved') }}
           restore-keys: spm-${{ runner.os }}-
 
-      - name: Prepare + build dependencies (skip if cached)
+      # ===== 依赖：准备源码 + 归档 =====
+      - name: Prepare dependency sources + archives
         run: |
           set -eux
-          for p in macos apple-gpu-vulkan-experiment ios-network ios-storage ios-compression kernel-host-tools; do
+          for p in macos apple-gpu-vulkan-experiment ios-network ios-storage ios-compression; do
             dependencies/prepare.sh --product "$p"
           done
+          # kernel-host-tools 的 pahole/libelf 走 SHA-256 归档清单
+          dependencies/prepare.sh --archive-manifest dependencies/kernel-host-tools/archives.tsv \
+                                  --cache "$PWD/.build/dependency-cache"
+          dependencies/prepare.sh --product kernel-host-tools
+
+      # ===== 依赖：编译（参数已按官方 CLI 修正）=====
+      - name: Build dependencies (skip if cached)
+        run: |
+          set -eux
           GPU=".build/dependencies/apple-gpu-vulkan-experiment/ios-device-arm64"
           if [ "${{ steps.c-prefix.outputs.cache-hit }}" = "true" ] && [ -d "$GPU" ]; then
-            echo ">>> [缓存命中] 依赖前缀，跳编译"
-          else
-            dependencies/build.sh --platform macos
-            dependencies/build-apple-gpu.sh --platform ios --prefix "$PWD/$GPU"
-            dependencies/build-ios-network.sh --platform ios
-            dependencies/build-ios-storage.sh
-            dependencies/build-ios-zstd.sh
-            dependencies/build-kernel-host-tools.sh
+            echo ">>> [缓存命中] 依赖前缀，跳过编译"; exit 0
           fi
-          du -sh .build/dependencies 2>/dev/null || true
+          # macOS 非图形静态库（注意：build.sh 不接受 --platform）
+          dependencies/build.sh
+          # iOS device GPU（Mesa Zink on <后端>；MoltenVK 改造见 MOLTENVK_SWAP.md）
+          dependencies/build-apple-gpu.sh --platform ios --prefix "$PWD/$GPU"
+          # iOS 网络闭包（glib/libslirp）
+          dependencies/build-ios-network.sh --platform ios
+          # 存储/压缩 XCFramework（无参数）
+          dependencies/build-ios-storage.sh
+          dependencies/build-ios-zstd.sh
+          # kernel host tools（pahole/libelf，需上面 archive 已准备）
+          dependencies/build-kernel-host-tools.sh
+          du -sh .build/dependencies || true
 
       - name: Save deps prefixes (size-guarded)
         if: always() && steps.c-prefix.outputs.cache-hit != 'true'
         run: |
           set -eux
           MB=$(du -sm .build/dependencies 2>/dev/null | awk '{print $1}')
-          echo "依赖前缀体积 = ${MB:-0} MB，上限 $MAX_CACHE_MB MB"
-          if [ -d ".build/dependencies" ] && [ "${MB:-0}" -le "$MAX_CACHE_MB" ]; then
+          echo "依赖前缀体积 = ${MB:-0} MB / 上限 $MAX_CACHE_MB MB"
+          if [ -d ".build/dependencies" ] && [ "${MB:-0}" -le "$MAX_CACHE_MB" ] && [ "${MB:-0}" -gt 0 ]; then
             echo "SAVE=1" >> "$GITHUB_ENV"
           else
-            echo ">>> 超过上限或不存在，跳过保存（不会污染缓存配额）"
-            echo "SAVE=0" >> "$GITHUB_ENV"
+            echo ">>> 超限/不存在，跳过保存"; echo "SAVE=0" >> "$GITHUB_ENV"
           fi
       - name: Commit deps prefixes cache
         if: always() && steps.c-prefix.outputs.cache-hit != 'true' && env.SAVE == '1'
@@ -146,7 +153,6 @@ jobs:
             gh release download 1.0b15-release -R imxieyi/Kernarium -p 'lineage24-*.tar.gz' -D .build/rootfs --clobber
           ls -R .build/kernel/artifacts .build/rootfs
 
-      # ================= 缓存 5：打包好的 XCFrameworks =================
       - name: Restore XCFrameworks
         id: c-xcfw
         uses: actions/cache@v4
@@ -159,14 +165,12 @@ jobs:
         run: |
           set -eux
           if [ "${{ steps.c-xcfw.outputs.cache-hit }}" = "true" ] && [ -n "$(ls -A .build/kernarium-xcframeworks 2>/dev/null)" ]; then
-            echo ">>> [缓存命中] XCFrameworks，跳过"
-          else
-            # runtime 编译开 ccache（这里编译器由 CMake 解析，可被 launcher 拦截）
-            LAUNCH="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_OBJC_COMPILER_LAUNCHER=ccache -DCMAKE_OBJCXX_COMPILER_LAUNCHER=ccache"
-            cmake --preset kernarium-ios-device-android $LAUNCH
-            cmake --build --preset kernarium-ios-device-android
-            Kernarium/scripts/package-ios-frameworks.sh --sdk device --runtimes android
+            echo ">>> [缓存命中] XCFrameworks，跳过"; exit 0
           fi
+          LAUNCH="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_OBJC_COMPILER_LAUNCHER=ccache -DCMAKE_OBJCXX_COMPILER_LAUNCHER=ccache"
+          cmake --preset kernarium-ios-device-android $LAUNCH
+          cmake --build --preset kernarium-ios-device-android
+          Kernarium/scripts/package-ios-frameworks.sh --sdk device --runtimes android
           ls -1 .build/kernarium-xcframeworks
 
       - name: Build Andarium app (unsigned)
